@@ -646,6 +646,9 @@ def parse(
     """Convenience function: parse images or documents in one call.
 
     Creates a :class:`GlmOcr` instance, runs parsing, and cleans up.
+    With ``stream=True``, the parser is created on first iteration and stays
+    open until the generator is exhausted or closed. Close the generator when
+    stopping iteration early (for example, with :func:`contextlib.closing`).
 
     Examples::
 
@@ -677,7 +680,7 @@ def parse(
         timeout:  Request timeout in seconds.
         log_level: Logging level.
     """
-    with GlmOcr(
+    parser_options: Dict[str, Any] = dict(
         config_path=config_path,
         api_key=api_key,
         api_url=api_url,
@@ -686,10 +689,27 @@ def parse(
         timeout=timeout,
         log_level=log_level,
         env_file=env_file,
-    ) as parser:
+    )
+
+    if stream:
+
+        def _parse_stream() -> Generator[PipelineResult, None, None]:
+            # Keep the context open while the lazy parsing iterator is consumed.
+            with GlmOcr(**parser_options) as parser:
+                yield from parser.parse(
+                    images,
+                    stream=True,
+                    save_layout_visualization=save_layout_visualization,
+                    preserve_order=preserve_order,
+                    **kwargs,
+                )
+
+        return _parse_stream()
+
+    with GlmOcr(**parser_options) as parser:
         return parser.parse(
             images,
-            stream=stream,
+            stream=False,
             save_layout_visualization=save_layout_visualization,
             preserve_order=preserve_order,
             **kwargs,

@@ -2653,3 +2653,160 @@ class TestMaaSClientServerProtocolRoundtrip:
                     content_type="application/json",
                 )
                 assert resp.status_code == 200
+
+
+class TestConvenienceParseLifetime:
+    """The convenience API owns its backend until streaming finishes."""
+
+    @pytest.fixture(params=["maas", "selfhosted"])
+    def backend(self, request, monkeypatch):
+        from glmocr.config import _ENV_MAP, ENV_PREFIX
+        from glmocr.parser_result import PipelineResult
+
+        for suffix in _ENV_MAP:
+            monkeypatch.delenv(f"{ENV_PREFIX}{suffix}", raising=False)
+        monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+        monkeypatch.setattr("glmocr.config._find_dotenv", lambda: None)
+
+        instances = []
+
+        class Backend:
+            def __init__(self, config):
+                self.active = False
+                self.stops = 0
+                self.failure = None
+                instances.append(self)
+
+            def start(self):
+                self.active = True
+
+            def stop(self):
+                self.active = False
+                self.stops += 1
+
+            def parse(self, source, **kwargs):
+                assert self.active, "backend was closed before parsing"
+                if self.failure:
+                    raise self.failure
+                return {"md_results": source, "layout_details": []}
+
+            def process(self, request_data, **kwargs):
+                for item in request_data["messages"][0]["content"]:
+                    assert self.active, "backend was closed before parsing"
+                    if self.failure:
+                        raise self.failure
+                    source = item["image_url"]["url"].removeprefix("file://")
+                    yield PipelineResult([], source, [source])
+
+        target = (
+            "glmocr.maas_client.MaaSClient"
+            if request.param == "maas"
+            else "glmocr.pipeline.Pipeline"
+        )
+        monkeypatch.setattr(target, Backend)
+        return request.param, instances
+
+    def test_stream_lives_until_exhausted(self, backend):
+        from glmocr import parse
+
+        mode, instances = backend
+        results = parse(
+            ["https://example.com/a.png", "https://example.com/b.png"],
+            mode=mode,
+            api_key="test-key",
+            stream=True,
+        )
+        first = next(results)
+        assert first.markdown_result == "https://example.com/a.png"
+        assert instances[0].active
+        assert next(results).markdown_result == "https://example.com/b.png"
+        assert instances[0].active
+        with pytest.raises(StopIteration):
+            next(results)
+        assert not instances[0].active
+        assert instances[0].stops == 1
+
+    def test_explicit_stream_close_releases_backend(self, backend):
+        from glmocr import parse
+
+        mode, instances = backend
+        results = parse(
+            ["https://example.com/a.png", "https://example.com/b.png"],
+            mode=mode,
+            api_key="test-key",
+            stream=True,
+        )
+        assert next(results).markdown_result == "https://example.com/a.png"
+        assert instances[0].active
+        results.close()
+        assert not instances[0].active
+        assert instances[0].stops == 1
+
+    def test_stream_exception_releases_backend(self, backend):
+        from glmocr import parse
+
+        mode, instances = backend
+        results = parse(
+            ["https://example.com/a.png", "https://example.com/b.png"],
+            mode=mode,
+            api_key="test-key",
+            stream=True,
+        )
+        assert next(results).markdown_result == "https://example.com/a.png"
+        failure = KeyboardInterrupt("consumer stopped")
+        with pytest.raises(KeyboardInterrupt) as caught:
+            results.throw(failure)
+        assert caught.value is failure
+        assert not instances[0].active
+        assert instances[0].stops == 1
+
+    def test_backend_failure_releases_backend(self, backend):
+        from glmocr import parse
+
+        mode, instances = backend
+        results = parse(
+            ["https://example.com/a.png", "https://example.com/b.png"],
+            mode=mode,
+            api_key="test-key",
+            stream=True,
+        )
+        assert next(results).markdown_result == "https://example.com/a.png"
+        failure = RuntimeError("backend failed")
+        instances[0].failure = failure
+        if mode == "maas":
+            assert next(results)._error == "backend failed"
+            with pytest.raises(StopIteration):
+                next(results)
+        else:
+            with pytest.raises(RuntimeError) as caught:
+                next(results)
+            assert caught.value is failure
+        assert not instances[0].active
+        assert instances[0].stops == 1
+
+    def test_unused_stream_never_starts_backend(self, backend):
+        from glmocr import parse
+
+        mode, instances = backend
+        results = parse(
+            "https://example.com/a.png", mode=mode, api_key="test-key", stream=True
+        )
+        results.close()
+        assert instances == []
+
+    @pytest.mark.parametrize("multiple", [False, True])
+    def test_nonstream_returns_results_and_closes_backend(self, backend, multiple):
+        from glmocr import parse
+        from glmocr.parser_result import PipelineResult
+
+        mode, instances = backend
+        source = "https://example.com/a.png"
+        result = parse([source] if multiple else source, mode=mode, api_key="test-key")
+        if multiple:
+            assert isinstance(result, list)
+            assert len(result) == 1
+            result = result[0]
+        assert isinstance(result, PipelineResult)
+        assert result.markdown_result == source
+        assert not instances[0].active
+        assert instances[0].stops == 1
